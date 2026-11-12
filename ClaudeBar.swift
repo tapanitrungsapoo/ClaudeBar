@@ -63,7 +63,7 @@ final class Model: ObservableObject {
     }
 
     init() {
-        Task { while true { await refresh(); try? await Task.sleep(for: .seconds(60)) } }
+        Task { while true { await refresh(); try? await Task.sleep(for: .seconds(300)) } }
     }
 
     var label: String {
