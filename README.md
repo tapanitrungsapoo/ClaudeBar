@@ -23,5 +23,7 @@ Tick **Open at login** in the popup to start it automatically.
 - Every 5 minutes it calls `GET https://api.anthropic.com/api/oauth/usage`, the same endpoint behind `/usage` in Claude Code.
   This only reads numbers. It does not use any of your quota.
   Polling every minute triggers HTTP 429 (rate limited), so keep it at 5 minutes.
+- "Today +N%" under Weekly is computed locally: current weekly % minus the first reading of the day.
+  Usage before the app's first refresh that day is not counted.
 - The endpoint is undocumented and may change.
 - If the popup says the token expired, run Claude Code once to refresh it.

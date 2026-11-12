@@ -49,6 +49,15 @@ func resetText(_ s: String?, now: Date = Date()) -> String {
     return "Resets " + f.string(from: d)
 }
 
+// Weekly % at the start of today. The API has no daily number, so "today" = current - this.
+// ponytail: counts from the first reading of the day; usage before the app's first refresh today
+// (Mac off, other devices) and usage before a same-day weekly reset are missed.
+func todayBase(current w: Double, savedDay: Double, savedBase: Double, today: Double) -> Double {
+    if savedDay != today { return w }   // first reading today
+    if w < savedBase { return 0 }       // weekly limit reset today
+    return savedBase
+}
+
 // MARK: - Model
 
 @MainActor
@@ -57,6 +66,7 @@ final class Model: ObservableObject {
     @Published var plan = ""
     @Published var error: String?
     @Published var updated: Date?
+    @Published var todayWeekly: Double?
     // Plain @Published (not @State): the Command Line Tools SDK ships without the SwiftUI macro plugin.
     @Published var atLogin = SMAppService.mainApp.status == .enabled {
         didSet { try? atLogin ? SMAppService.mainApp.register() : SMAppService.mainApp.unregister() }
@@ -82,6 +92,14 @@ final class Model: ObservableObject {
             let code = (resp as? HTTPURLResponse)?.statusCode ?? 0
             guard code == 200 else { throw Msg(code == 401 ? "Token expired – run Claude Code once" : "HTTP \(code)") }
             usage = try JSONDecoder().decode(Usage.self, from: data)
+            if let w = usage?.seven_day?.utilization {
+                // Saved in UserDefaults so an app restart doesn't reset today's count.
+                let d = UserDefaults.standard
+                let today = Calendar.current.startOfDay(for: Date()).timeIntervalSince1970
+                let base = todayBase(current: w, savedDay: d.double(forKey: "day"), savedBase: d.double(forKey: "base"), today: today)
+                d.set(today, forKey: "day"); d.set(base, forKey: "base")
+                todayWeekly = w - base
+            }
             updated = Date()
             error = nil
         } catch {
@@ -95,6 +113,7 @@ final class Model: ObservableObject {
 struct Row: View {
     let title: String
     let w: Window?
+    var extra: String? = nil
     var body: some View {
         let u = w?.utilization ?? 0
         VStack(alignment: .leading, spacing: 4) {
@@ -105,7 +124,7 @@ struct Row: View {
             }
             ProgressView(value: min(u / 100, 1))
                 .tint(u >= 90 ? .red : u >= 70 ? .orange : .blue)
-            Text(resetText(w?.resets_at)).font(.caption).foregroundStyle(.secondary)
+            Text(resetText(w?.resets_at) + (extra.map { " · " + $0 } ?? "")).font(.caption).foregroundStyle(.secondary)
         }
     }
 }
@@ -123,7 +142,7 @@ struct Panel: View {
             }
             if let e = m.error { Text(e).font(.caption).foregroundStyle(.red) }
             Row(title: "5-hour session", w: m.usage?.five_hour)
-            Row(title: "Weekly", w: m.usage?.seven_day)
+            Row(title: "Weekly", w: m.usage?.seven_day, extra: m.todayWeekly.map { "Today +\(Int($0.rounded()))%" })
             if let f = m.usage?.weekly(model: "Fable") { Row(title: "Weekly · Fable", w: f) }
             Divider()
             HStack {
