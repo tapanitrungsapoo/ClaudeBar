@@ -25,5 +25,8 @@ Tick **Open at login** in the popup to start it automatically.
   Polling every minute triggers HTTP 429 (rate limited), so keep it at 5 minutes.
 - "Today +N%" under Weekly is computed locally: current weekly % minus the first reading of the day.
   Usage before the app's first refresh that day is not counted.
+- "Weekly N% by model / by project" splits the used weekly limit by model + effort and by project folder.
+  These are estimates from local Claude Code transcripts (`~/.claude/projects`): tokens weighted by API price,
+  with the Fable total rescaled to the real share the API reports. Usage on claude.ai or other machines is not counted.
 - The endpoint is undocumented and may change.
 - If the popup says the token expired, run Claude Code once to refresh it.
