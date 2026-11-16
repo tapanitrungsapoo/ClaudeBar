@@ -58,6 +58,13 @@ func resetText(_ s: String?, now: Date = Date()) -> String {
     return "Resets " + f.string(from: d)
 }
 
+// Seconds until the next refresh: every 5 minutes, or just after the nearest reset if that comes sooner.
+// The 10 s floor keeps a reset that lands right after a refresh from causing back-to-back calls (HTTP 429).
+func nextRefresh(_ resets: [String?], now: Date = Date(), every: Double = 300) -> Double {
+    let soonest = resets.compactMap { parseDate($0)?.timeIntervalSince(now) }.filter { $0 > 0 }.min()
+    return max(10, min(every, (soonest ?? every) + 5))
+}
+
 // Weekly % at the start of today. The API has no daily number, so "today" = current - this.
 // ponytail: counts from the first reading of the day; usage before the app's first refresh today
 // (Mac off, other devices) and usage before a same-day weekly reset are missed.
@@ -205,7 +212,14 @@ final class Model: ObservableObject {
     }
 
     init() {
-        Task { while true { await refresh(); try? await Task.sleep(for: .seconds(300)) } }
+        Task {
+            while true {
+                await refresh()
+                let u = usage
+                let delay = nextRefresh([u?.five_hour?.resets_at, u?.seven_day?.resets_at, u?.weekly(model: "Fable")?.resets_at])
+                try? await Task.sleep(for: .seconds(delay))
+            }
+        }
     }
 
     var label: String {
@@ -259,8 +273,15 @@ struct Row: View {
                 Spacer()
                 Text(w == nil ? "–" : "\(Int(u.rounded()))%").bold()
             }
-            ProgressView(value: min(u / 100, 1))
-                .tint(u >= 90 ? .red : u >= 70 ? .orange : .blue)
+            // Hand-drawn bar: ProgressView ignores .tint in a menu bar window and always draws the accent color.
+            GeometryReader { g in
+                ZStack(alignment: .leading) {
+                    Capsule().fill(.quaternary)
+                    Capsule().fill(u >= 90 ? Color.red : u >= 70 ? .orange : .blue)
+                        .frame(width: g.size.width * min(max(u / 100, 0), 1))
+                }
+            }
+            .frame(height: 6)
             Text(resetText(w?.resets_at) + (extra.map { " · " + $0 } ?? "")).font(.caption).foregroundStyle(.secondary)
         }
     }

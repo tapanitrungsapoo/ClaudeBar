@@ -20,7 +20,7 @@ Tick **Open at login** in the popup to start it automatically.
 
 ## How it works
 
-- Every 5 minutes it calls `GET https://api.anthropic.com/api/oauth/usage`, the same endpoint behind `/usage` in Claude Code.
+- Every 5 minutes (and right after each limit resets) it calls `GET https://api.anthropic.com/api/oauth/usage`, the same endpoint behind `/usage` in Claude Code.
   This only reads numbers. It does not use any of your quota.
   Polling every minute triggers HTTP 429 (rate limited), so keep it at 5 minutes.
 - "Today +N%" under Weekly is computed locally: current weekly % minus the first reading of the day.
