@@ -131,7 +131,10 @@ final class Transcripts: @unchecked Sendable {
                   let ts = d["timestamp"] as? String,
                   let m = d["message"] as? [String: Any],
                   let model = m["model"] as? String, model.hasPrefix("claude"),
-                  let u = m["usage"] as? [String: Any] else { continue }
+                  let u = m["usage"] as? [String: Any],
+                  // Only the Claude subscription counts toward the weekly limit. Anthropic request IDs start
+                  // with "req_"; Bedrock (company account) lines carry a UUID and an arn:aws:bedrock model.
+                  (d["requestId"] as? String)?.hasPrefix("req_") == true else { continue }
             if cwd == nil { cwd = d["cwd"] as? String }
             let r = rates(model)
             let cc = u["cache_creation"] as? [String: Any]
