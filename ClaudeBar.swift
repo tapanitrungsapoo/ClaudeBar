@@ -26,21 +26,51 @@ struct Usage: Decodable {
             .map { Window(utilization: $0.percent ?? 0, resets_at: $0.resets_at) }
     }
 }
+struct Profile: Decodable { struct Org: Decodable { let uuid: String }; let organization: Org }
 struct Creds: Decodable { let accessToken: String; let subscriptionType: String? }
 struct Msg: Error, CustomStringConvertible { let description: String; init(_ s: String) { description = s } }
 
-// Token that Claude Code keeps in the Keychain. Going through /usr/bin/security avoids a Keychain prompt.
-func readCredentials() throws -> Creds {
+// Keychain entry of the default Claude Code login. A login made with CLAUDE_CONFIG_DIR set is stored
+// under this name plus "-" and the first 8 hex digits of sha256(config dir).
+let baseService = "Claude Code-credentials"
+
+// Going through /usr/bin/security avoids a Keychain prompt.
+func security(_ args: [String]) -> Data? {
     let p = Process()
     p.executableURL = URL(fileURLWithPath: "/usr/bin/security")
-    p.arguments = ["find-generic-password", "-s", "Claude Code-credentials", "-w"]
+    p.arguments = args
     let out = Pipe(); p.standardOutput = out; p.standardError = Pipe()
-    try p.run()
+    guard (try? p.run()) != nil else { return nil }
     let data = out.fileHandleForReading.readDataToEndOfFile()
     p.waitUntilExit()
-    guard p.terminationStatus == 0 else { throw Msg("No Claude Code login found") }
+    return p.terminationStatus == 0 ? data : nil
+}
+
+// Every Claude Code login on this Mac, default one first. dump-keychain lists names only, no secrets.
+func credentialServices() -> [String] {
+    let text = security(["dump-keychain"]).map { String(decoding: $0, as: UTF8.self) } ?? ""
+    let names = text.split(separator: "\n").compactMap { line -> String? in
+        guard let r = line.range(of: #""svce"<blob>=""#) else { return nil }
+        let name = String(line[r.upperBound...].dropLast())
+        return name.range(of: #"^Claude Code-credentials(-[0-9a-f]{8})?$"#, options: .regularExpression) != nil ? name : nil
+    }
+    return Set(names).sorted()   // baseService is a prefix of the others, so it sorts first
+}
+
+func readCredentials(service: String) throws -> Creds {
+    guard let data = security(["find-generic-password", "-s", service, "-w"]) else { throw Msg("No Claude Code login found") }
     struct Wrap: Decodable { let claudeAiOauth: Creds }
     return try JSONDecoder().decode(Wrap.self, from: data).claudeAiOauth
+}
+
+func api<T: Decodable>(_ path: String, token: String) async throws -> T {
+    var req = URLRequest(url: URL(string: "https://api.anthropic.com/api/oauth/" + path)!)
+    req.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+    req.setValue("oauth-2025-04-20", forHTTPHeaderField: "anthropic-beta")
+    let (data, resp) = try await URLSession.shared.data(for: req)
+    let code = (resp as? HTTPURLResponse)?.statusCode ?? 0
+    guard code == 200 else { throw Msg(code == 401 ? "Token expired – run Claude Code once" : "HTTP \(code)") }
+    return try JSONDecoder().decode(T.self, from: data)
 }
 
 func parseDate(_ s: String?) -> Date? {
@@ -112,28 +142,43 @@ func top(_ d: [String: Double], limit: Int = 5) -> [Slice] {
     return out
 }
 
-// Reads ~/.claude/projects/**/*.jsonl. Only sees Claude Code on this Mac (not claude.ai chat or other machines).
+// Claude Code writes transcripts to <config dir>/projects: ~/.claude, or the folder in CLAUDE_CONFIG_DIR.
+// ponytail: only finds config folders named ~/.claude*; a CLAUDE_CONFIG_DIR somewhere else is not read.
+func transcriptRoots() -> [URL] {
+    let home = FileManager.default.homeDirectoryForCurrentUser
+    let names = (try? FileManager.default.contentsOfDirectory(atPath: home.path)) ?? []
+    return names.filter { $0.hasPrefix(".claude") }.sorted()
+        .map { home.appendingPathComponent($0).appendingPathComponent("projects") }
+        .filter { var dir: ObjCBool = false; return FileManager.default.fileExists(atPath: $0.path, isDirectory: &dir) && dir.boolValue }
+}
+
+// Reads <config dir>/projects/**/*.jsonl. Only sees Claude Code on this Mac (not claude.ai chat or other machines).
 final class Transcripts: @unchecked Sendable {
     private let lock = NSLock()
     // Parsed files keyed by path; a file is re-read only when its mtime changes.
-    private var cache: [String: (mtime: Date, cwd: String?, entries: [String: Entry])] = [:]
+    private var cache: [String: (mtime: Date, cwd: String?, owner: String?, entries: [String: Entry])] = [:]
     private static let needle = Data(#""type":"assistant""#.utf8)
+    private static let ownerNeedle = Data(#""session-owner""#.utf8)
 
     private static func num(_ d: [String: Any], _ k: String) -> Double { (d[k] as? NSNumber)?.doubleValue ?? 0 }
 
-    static func parse(_ url: URL) -> (cwd: String?, entries: [String: Entry]) {
-        guard let data = try? Data(contentsOf: url, options: .mappedIfSafe) else { return (nil, [:]) }
-        var cwd: String?
+    // owner = organization of the logged-in account, from the session's "session-owner" lines.
+    // ponytail: one owner per file (the last one); a /login to another account mid-session is not split.
+    static func parse(_ url: URL) -> (cwd: String?, owner: String?, entries: [String: Entry]) {
+        guard let data = try? Data(contentsOf: url, options: .mappedIfSafe) else { return (nil, nil, [:]) }
+        var cwd: String?, owner: String?
         var out: [String: Entry] = [:]
-        for line in data.split(separator: 0x0A) where line.range(of: needle) != nil {
-            guard let d = try? JSONSerialization.jsonObject(with: line) as? [String: Any],
-                  d["type"] as? String == "assistant",
+        for line in data.split(separator: 0x0A)
+        where line.range(of: needle) != nil || line.range(of: ownerNeedle) != nil {
+            guard let d = try? JSONSerialization.jsonObject(with: line) as? [String: Any] else { continue }
+            if d["type"] as? String == "session-owner" { owner = (d["organizationUuid"] as? String) ?? owner; continue }
+            guard d["type"] as? String == "assistant",
                   let ts = d["timestamp"] as? String,
                   let m = d["message"] as? [String: Any],
                   let model = m["model"] as? String, model.hasPrefix("claude"),
                   let u = m["usage"] as? [String: Any],
-                  // Only the Claude subscription counts toward the weekly limit. Anthropic request IDs start
-                  // with "req_"; Bedrock (company account) lines carry a UUID and an arn:aws:bedrock model.
+                  // Only Claude subscription requests count toward a plan limit. Anthropic request IDs start
+                  // with "req_"; Bedrock lines carry a UUID and an arn:aws:bedrock model.
                   (d["requestId"] as? String)?.hasPrefix("req_") == true else { continue }
             if cwd == nil { cwd = d["cwd"] as? String }
             let r = rates(model)
@@ -147,36 +192,47 @@ final class Transcripts: @unchecked Sendable {
             let id = (m["id"] as? String) ?? (d["requestId"] as? String) ?? (d["uuid"] as? String) ?? ts
             out[id] = Entry(ts: ts, model: model, effort: d["effort"] as? String, cost: cost)
         }
-        return (cwd, out)
+        return (cwd, owner, out)
     }
 
-    func breakdown(since start: Date, calibrate: (name: String, share: Double)? = nil, root: URL = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".claude/projects")) -> Breakdown {
+    // Usage since `start` by the account whose organization uuid is `org`.
+    func breakdown(since start: Date, org: String, calibrate: (name: String, share: Double)? = nil, roots: [URL] = transcriptRoots()) -> Breakdown {
         lock.lock(); defer { lock.unlock() }
-        var files: [(url: URL, mtime: Date)] = []
-        if let en = FileManager.default.enumerator(at: root, includingPropertiesForKeys: [.contentModificationDateKey]) {
+        var files: [(url: URL, root: URL, mtime: Date)] = []
+        for root in roots {
+            guard let en = FileManager.default.enumerator(at: root, includingPropertiesForKeys: [.contentModificationDateKey]) else { continue }
             for case let u as URL in en where u.pathExtension == "jsonl" {
                 if let mt = try? u.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate, mt >= start {
-                    files.append((u, mt))
+                    files.append((u, root, mt))
                 }
             }
         }
-        // Session files before their subagent files, so the project name comes from the session's launch folder.
+        // Session files before their subagent files, so subagents can take the session's owner and project name.
         files.sort { $0.url.pathComponents.count < $1.url.pathComponents.count }
         let live = Set(files.map { $0.url.path })
         cache = cache.filter { live.contains($0.key) }
 
         // Timestamps are all UTC ISO-8601, so the first 19 chars compare correctly as strings.
         let startStr = ISO8601DateFormatter().string(from: start).prefix(19)
-        var names: [String: String] = [:]
+        var names: [String: String] = [:], owners: [String: String] = [:]
         var merged: [String: (entry: Entry, proj: String)] = [:]
         for f in files {
             let key = f.url.path
             if cache[key]?.mtime != f.mtime {
                 let p = Self.parse(f.url)
-                cache[key] = (f.mtime, p.cwd, p.entries)
+                cache[key] = (f.mtime, p.cwd, p.owner, p.entries)
             }
             guard let c = cache[key] else { continue }
-            let proj = String(key.dropFirst(root.path.count + 1).split(separator: "/").first ?? "?")
+            // Subagent transcripts (<project>/<session>/subagents/*.jsonl) have no owner line: use the session's.
+            var owner = c.owner
+            var dir = f.url.deletingLastPathComponent()
+            while owner == nil, dir.path.count > f.root.path.count {
+                owner = owners[dir.path + ".jsonl"]
+                dir = dir.deletingLastPathComponent()
+            }
+            owners[key] = owner
+            guard owner == org else { continue }
+            let proj = f.root.appendingPathComponent(String(key.dropFirst(f.root.path.count + 1).split(separator: "/").first ?? "?")).path
             if names[proj] == nil, let cwd = c.cwd { names[proj] = (cwd as NSString).lastPathComponent }
             for (id, e) in c.entries where e.ts.prefix(19) >= startStr { merged[id] = (e, proj) }
         }
@@ -192,7 +248,7 @@ final class Transcripts: @unchecked Sendable {
         for v in merged.values {
             let cost = v.entry.cost * (scoped.map { v.entry.model.contains($0) } == true ? scale : 1)
             byModel[modelLabel(v.entry.model, effort: v.entry.effort), default: 0] += cost
-            byProj[names[v.proj] ?? v.proj, default: 0] += cost
+            byProj[names[v.proj] ?? (v.proj as NSString).lastPathComponent, default: 0] += cost
         }
         return Breakdown(models: top(byModel), projects: top(byProj))
     }
@@ -200,15 +256,35 @@ final class Transcripts: @unchecked Sendable {
 
 // MARK: - Model
 
+// One column per organization. Two config folders can hold the same account (for example ~/.claude and
+// ~/.claude-personal); keep the first one, unless only a later one loaded without an error.
+func dedupe(_ list: [Account]) -> [Account] {
+    var out: [Account] = []
+    for a in list {
+        guard let o = a.org, let i = out.firstIndex(where: { $0.org == o }) else { out.append(a); continue }
+        if out[i].error != nil, a.error == nil { out[i] = a }
+    }
+    return out
+}
+
+struct Account: Identifiable {
+    let service: String
+    var id: String { service }
+    var plan = ""
+    var org: String?
+    var usage: Usage?
+    var error: String?
+    var todayWeekly: Double?
+    var breakdown = Breakdown()
+}
+
 @MainActor
 final class Model: ObservableObject {
-    @Published var usage: Usage?
-    @Published var plan = ""
+    @Published var accounts: [Account] = []
     @Published var error: String?
     @Published var updated: Date?
-    @Published var todayWeekly: Double?
-    @Published var breakdown = Breakdown()
     private let transcripts = Transcripts()
+    private var orgs: [String: String] = [:]   // access token -> organization uuid
     // Plain @Published (not @State): the Command Line Tools SDK ships without the SwiftUI macro plugin.
     @Published var atLogin = SMAppService.mainApp.status == .enabled {
         didSet { try? atLogin ? SMAppService.mainApp.register() : SMAppService.mainApp.unregister() }
@@ -218,47 +294,67 @@ final class Model: ObservableObject {
         Task {
             while true {
                 await refresh()
-                let u = usage
-                let delay = nextRefresh([u?.five_hour?.resets_at, u?.seven_day?.resets_at, u?.weekly(model: "Fable")?.resets_at])
-                try? await Task.sleep(for: .seconds(delay))
+                let resets = accounts.flatMap { a in
+                    [a.usage?.five_hour?.resets_at, a.usage?.seven_day?.resets_at, a.usage?.weekly(model: "Fable")?.resets_at]
+                }
+                try? await Task.sleep(for: .seconds(nextRefresh(resets)))
             }
         }
     }
 
+    // Menu bar shows the default login (~/.claude); the other accounts are in the popup.
     var label: String {
         func pct(_ w: Window?) -> String { w.map { "\(Int($0.utilization.rounded()))%" } ?? "–" }
-        return "✱ \(pct(usage?.five_hour)) · W \(pct(usage?.seven_day))"
+        let u = accounts.first?.usage
+        return "✱ \(pct(u?.five_hour)) · W \(pct(u?.seven_day))"
     }
 
     func refresh() async {
+        let services = credentialServices()
+        error = services.isEmpty ? "No Claude Code login found" : nil
+        var out: [Account] = []
+        for s in services { out.append(await load(s)) }
+        accounts = dedupe(out)
+        if out.contains(where: { $0.error == nil }) { updated = Date() }
+    }
+
+    private func load(_ service: String) async -> Account {
+        // Start from the last good data, so a failed refresh keeps the old numbers on screen.
+        var a = accounts.first { $0.service == service } ?? Account(service: service)
+        a.error = nil
+        var org: String?
         do {
-            let creds = try readCredentials()
-            plan = creds.subscriptionType?.capitalized ?? ""
-            var req = URLRequest(url: URL(string: "https://api.anthropic.com/api/oauth/usage")!)
-            req.setValue("Bearer \(creds.accessToken)", forHTTPHeaderField: "Authorization")
-            req.setValue("oauth-2025-04-20", forHTTPHeaderField: "anthropic-beta")
-            let (data, resp) = try await URLSession.shared.data(for: req)
-            let code = (resp as? HTTPURLResponse)?.statusCode ?? 0
-            guard code == 200 else { throw Msg(code == 401 ? "Token expired – run Claude Code once" : "HTTP \(code)") }
-            usage = try JSONDecoder().decode(Usage.self, from: data)
-            if let w = usage?.seven_day?.utilization {
-                // Saved in UserDefaults so an app restart doesn't reset today's count.
+            let creds = try readCredentials(service: service)
+            a.plan = creds.subscriptionType?.capitalized ?? ""
+            let usage: Usage = try await api("usage", token: creds.accessToken)
+            a.usage = usage
+            if let w = usage.seven_day?.utilization {
+                // Saved in UserDefaults so an app restart doesn't reset today's count. The default login
+                // keeps the old keys "day"/"base"; others add their Keychain suffix.
+                let k = String(service.dropFirst(baseService.count))
                 let d = UserDefaults.standard
                 let today = Calendar.current.startOfDay(for: Date()).timeIntervalSince1970
-                let base = todayBase(current: w, savedDay: d.double(forKey: "day"), savedBase: d.double(forKey: "base"), today: today)
-                d.set(today, forKey: "day"); d.set(base, forKey: "base")
-                todayWeekly = w - base
+                let base = todayBase(current: w, savedDay: d.double(forKey: "day" + k), savedBase: d.double(forKey: "base" + k), today: today)
+                d.set(today, forKey: "day" + k); d.set(base, forKey: "base" + k)
+                a.todayWeekly = w - base
             }
-            updated = Date()
-            error = nil
+            // The organization tells this account's transcripts apart from the other account's. Asked once per token.
+            if orgs[creds.accessToken] == nil, let p: Profile = try? await api("profile", token: creds.accessToken) {
+                orgs[creds.accessToken] = p.organization.uuid
+            }
+            org = orgs[creds.accessToken]
+            a.org = org
         } catch {
-            self.error = "\(error)"
+            a.error = "\(error)"
         }
         // Same 7-day window as the weekly limit. Runs off the main thread: transcripts can be hundreds of MB.
-        let start = (parseDate(usage?.seven_day?.resets_at) ?? Date()).addingTimeInterval(-7 * 86400)
-        let t = transcripts
-        let cal = usage?.scopedShare()
-        breakdown = await Task.detached { t.breakdown(since: start, calibrate: cal) }.value
+        if let org {
+            let start = (parseDate(a.usage?.seven_day?.resets_at) ?? Date()).addingTimeInterval(-7 * 86400)
+            let t = transcripts
+            let cal = a.usage?.scopedShare()
+            a.breakdown = await Task.detached { t.breakdown(since: start, org: org, calibrate: cal) }.value
+        }
+        return a
     }
 }
 
@@ -309,31 +405,45 @@ struct Shares: View {
     }
 }
 
+struct AccountView: View {
+    let a: Account
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            Text(a.plan.isEmpty ? "Claude" : "Claude · \(a.plan)").font(.headline)
+            if let e = a.error { Text(e).font(.caption).foregroundStyle(.red) }
+            Row(title: "5-hour session", w: a.usage?.five_hour)
+            Row(title: "Weekly", w: a.usage?.seven_day, extra: a.todayWeekly.map { "Today +\(Int($0.rounded()))%" })
+            if let f = a.usage?.weekly(model: "Fable") { Row(title: "Weekly · Fable", w: f) }
+            if !a.breakdown.models.isEmpty, let w = a.usage?.seven_day?.utilization {
+                Divider()
+                let used = "Weekly \(Int(w.rounded()))% by"
+                Shares(title: "\(used) model · est.", items: a.breakdown.models, weekly: w)
+                Shares(title: "\(used) project · est.", items: a.breakdown.projects, weekly: w)
+            }
+        }
+        .frame(width: 272, alignment: .topLeading)
+    }
+}
+
 struct Panel: View {
     @ObservedObject var m: Model
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
-            HStack {
-                Text(m.plan.isEmpty ? "Claude" : "Claude · \(m.plan)").font(.headline)
-                Spacer()
-                Button { Task { await m.refresh() } } label: { Image(systemName: "arrow.clockwise") }
-                    .buttonStyle(.borderless)
-            }
             if let e = m.error { Text(e).font(.caption).foregroundStyle(.red) }
-            Row(title: "5-hour session", w: m.usage?.five_hour)
-            Row(title: "Weekly", w: m.usage?.seven_day, extra: m.todayWeekly.map { "Today +\(Int($0.rounded()))%" })
-            if let f = m.usage?.weekly(model: "Fable") { Row(title: "Weekly · Fable", w: f) }
-            if !m.breakdown.models.isEmpty, let w = m.usage?.seven_day?.utilization {
-                Divider()
-                let used = "Weekly \(Int(w.rounded()))% by"
-                Shares(title: "\(used) model · est.", items: m.breakdown.models, weekly: w)
-                Shares(title: "\(used) project · est.", items: m.breakdown.projects, weekly: w)
+            // One column per account, side by side, so two accounts don't make the popup taller than the screen.
+            HStack(alignment: .top, spacing: 14) {
+                ForEach(m.accounts) { a in
+                    if a.id != m.accounts.first?.id { Divider() }
+                    AccountView(a: a)
+                }
             }
             Divider()
             HStack {
                 Text(m.updated.map { "Updated " + $0.formatted(date: .omitted, time: .shortened) } ?? "Loading…")
                     .font(.caption).foregroundStyle(.secondary)
+                Button { Task { await m.refresh() } } label: { Image(systemName: "arrow.clockwise") }
+                    .buttonStyle(.borderless)
                 Spacer()
                 Toggle("Open at login", isOn: $m.atLogin)
                     .toggleStyle(.checkbox).font(.caption)
@@ -341,13 +451,24 @@ struct Panel: View {
             }
         }
         .padding(14)
-        .frame(width: 300)
+        // Ideal size, not a minimum: with a flexible width the menu bar window stays at its smallest
+        // width and clips the account columns.
+        .fixedSize()
     }
 }
 
 @main
 struct ClaudeBar: App {
     @StateObject private var m = Model()
+
+    init() {
+        // One copy only. The login item and macOS "reopen at login" can each start a copy (build.sh leaves
+        // one in the project folder and one in ~/Applications), and each copy adds its own menu bar item.
+        // ponytail: the older process (lower pid) wins; pid wraparound is ignored.
+        let me = ProcessInfo.processInfo.processIdentifier
+        if NSRunningApplication.runningApplications(withBundleIdentifier: Bundle.main.bundleIdentifier ?? "")
+            .contains(where: { $0.processIdentifier < me }) { exit(0) }
+    }
     var body: some Scene {
         MenuBarExtra { Panel(m: m) } label: { Text(m.label) }
             .menuBarExtraStyle(.window)
