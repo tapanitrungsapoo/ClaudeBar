@@ -26,39 +26,28 @@ struct Usage: Decodable {
             .map { Window(utilization: $0.percent ?? 0, resets_at: $0.resets_at) }
     }
 }
-struct Profile: Decodable { struct Org: Decodable { let uuid: String }; let organization: Org }
-struct Creds: Decodable { let accessToken: String; let subscriptionType: String? }
+struct Creds: Decodable {
+    let accessToken: String; let subscriptionType: String?
+    let expiresAt: Double?   // ms since 1970
+    // A minute early, so the token cannot run out during the call.
+    var expired: Bool { (expiresAt ?? .infinity) / 1000 < Date().timeIntervalSince1970 + 60 }
+}
 struct Msg: Error, CustomStringConvertible { let description: String; init(_ s: String) { description = s } }
+// HTTP 429. The limit is per login token, and Claude Code's own calls with that token count too.
+struct RateLimited: Error { let until: Date }
+// HTTP 401. Calls with an expired token get 401 first, and HTTP 429 when they continue.
+struct Unauthorized: Error {}
 
-// Keychain entry of the default Claude Code login. A login made with CLAUDE_CONFIG_DIR set is stored
-// under this name plus "-" and the first 8 hex digits of sha256(config dir).
-let baseService = "Claude Code-credentials"
-
-// Going through /usr/bin/security avoids a Keychain prompt.
-func security(_ args: [String]) -> Data? {
+// Token of the Claude Code login in ~/.claude. Going through /usr/bin/security avoids a Keychain prompt.
+func readCredentials() throws -> Creds {
     let p = Process()
     p.executableURL = URL(fileURLWithPath: "/usr/bin/security")
-    p.arguments = args
+    p.arguments = ["find-generic-password", "-s", "Claude Code-credentials", "-w"]
     let out = Pipe(); p.standardOutput = out; p.standardError = Pipe()
-    guard (try? p.run()) != nil else { return nil }
+    try p.run()
     let data = out.fileHandleForReading.readDataToEndOfFile()
     p.waitUntilExit()
-    return p.terminationStatus == 0 ? data : nil
-}
-
-// Every Claude Code login on this Mac, default one first. dump-keychain lists names only, no secrets.
-func credentialServices() -> [String] {
-    let text = security(["dump-keychain"]).map { String(decoding: $0, as: UTF8.self) } ?? ""
-    let names = text.split(separator: "\n").compactMap { line -> String? in
-        guard let r = line.range(of: #""svce"<blob>=""#) else { return nil }
-        let name = String(line[r.upperBound...].dropLast())
-        return name.range(of: #"^Claude Code-credentials(-[0-9a-f]{8})?$"#, options: .regularExpression) != nil ? name : nil
-    }
-    return Set(names).sorted()   // baseService is a prefix of the others, so it sorts first
-}
-
-func readCredentials(service: String) throws -> Creds {
-    guard let data = security(["find-generic-password", "-s", service, "-w"]) else { throw Msg("No Claude Code login found") }
+    guard p.terminationStatus == 0 else { throw Msg("No Claude Code login found") }
     struct Wrap: Decodable { let claudeAiOauth: Creds }
     return try JSONDecoder().decode(Wrap.self, from: data).claudeAiOauth
 }
@@ -68,9 +57,31 @@ func api<T: Decodable>(_ path: String, token: String) async throws -> T {
     req.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
     req.setValue("oauth-2025-04-20", forHTTPHeaderField: "anthropic-beta")
     let (data, resp) = try await URLSession.shared.data(for: req)
-    let code = (resp as? HTTPURLResponse)?.statusCode ?? 0
-    guard code == 200 else { throw Msg(code == 401 ? "Token expired – run Claude Code once" : "HTTP \(code)") }
+    let http = resp as? HTTPURLResponse
+    let code = http?.statusCode ?? 0
+    if code == 429 {
+        // Retry-After has been 0 and has been ~1,900 s. Wait at least a minute either way.
+        let wait = Double(http?.value(forHTTPHeaderField: "Retry-After") ?? "") ?? 0
+        throw RateLimited(until: Date().addingTimeInterval(max(wait, 60)))
+    }
+    if code == 401 { throw Unauthorized() }
+    guard code == 200 else { throw Msg("HTTP \(code)") }
     return try JSONDecoder().decode(T.self, from: data)
+}
+
+// Claude Code renews its token (about 8 h) only while it runs, so the login expires while Claude Code is idle.
+func loginExpired(_ creds: Creds) -> String {
+    let at = creds.expiresAt.map { " at " + Date(timeIntervalSince1970: $0 / 1000).formatted(date: .omitted, time: .shortened) } ?? ""
+    return "Login expired\(at). Run claude once."
+}
+
+// Organization of the account that is logged in to Claude Code. It changes with /login.
+func loggedInOrg() -> String? {
+    let file = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".claude.json")
+    guard let data = try? Data(contentsOf: file),
+          let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+          let account = json["oauthAccount"] as? [String: Any] else { return nil }
+    return account["organizationUuid"] as? String
 }
 
 func parseDate(_ s: String?) -> Date? {
@@ -142,17 +153,7 @@ func top(_ d: [String: Double], limit: Int = 5) -> [Slice] {
     return out
 }
 
-// Claude Code writes transcripts to <config dir>/projects: ~/.claude, or the folder in CLAUDE_CONFIG_DIR.
-// ponytail: only finds config folders named ~/.claude*; a CLAUDE_CONFIG_DIR somewhere else is not read.
-func transcriptRoots() -> [URL] {
-    let home = FileManager.default.homeDirectoryForCurrentUser
-    let names = (try? FileManager.default.contentsOfDirectory(atPath: home.path)) ?? []
-    return names.filter { $0.hasPrefix(".claude") }.sorted()
-        .map { home.appendingPathComponent($0).appendingPathComponent("projects") }
-        .filter { var dir: ObjCBool = false; return FileManager.default.fileExists(atPath: $0.path, isDirectory: &dir) && dir.boolValue }
-}
-
-// Reads <config dir>/projects/**/*.jsonl. Only sees Claude Code on this Mac (not claude.ai chat or other machines).
+// Reads ~/.claude/projects/**/*.jsonl. Only sees Claude Code on this Mac (not claude.ai chat or other machines).
 final class Transcripts: @unchecked Sendable {
     private let lock = NSLock()
     // Parsed files keyed by path; a file is re-read only when its mtime changes.
@@ -195,8 +196,10 @@ final class Transcripts: @unchecked Sendable {
         return (cwd, owner, out)
     }
 
-    // Usage since `start` by the account whose organization uuid is `org`.
-    func breakdown(since start: Date, org: String, calibrate: (name: String, share: Double)? = nil, roots: [URL] = transcriptRoots()) -> Breakdown {
+    // Usage since `start` by the account whose organization uuid is `org` (nil: every account). The filter keeps
+    // another account's sessions out after a /login switch.
+    func breakdown(since start: Date, org: String?, calibrate: (name: String, share: Double)? = nil,
+                   roots: [URL] = [FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".claude/projects")]) -> Breakdown {
         lock.lock(); defer { lock.unlock() }
         var files: [(url: URL, root: URL, mtime: Date)] = []
         for root in roots {
@@ -231,7 +234,7 @@ final class Transcripts: @unchecked Sendable {
                 dir = dir.deletingLastPathComponent()
             }
             owners[key] = owner
-            guard owner == org else { continue }
+            guard org == nil || owner == org else { continue }
             let proj = f.root.appendingPathComponent(String(key.dropFirst(f.root.path.count + 1).split(separator: "/").first ?? "?")).path
             if names[proj] == nil, let cwd = c.cwd { names[proj] = (cwd as NSString).lastPathComponent }
             for (id, e) in c.entries where e.ts.prefix(19) >= startStr { merged[id] = (e, proj) }
@@ -256,35 +259,24 @@ final class Transcripts: @unchecked Sendable {
 
 // MARK: - Model
 
-// One column per organization. Two config folders can hold the same account (for example ~/.claude and
-// ~/.claude-personal); keep the first one, unless only a later one loaded without an error.
-func dedupe(_ list: [Account]) -> [Account] {
-    var out: [Account] = []
-    for a in list {
-        guard let o = a.org, let i = out.firstIndex(where: { $0.org == o }) else { out.append(a); continue }
-        if out[i].error != nil, a.error == nil { out[i] = a }
-    }
-    return out
-}
-
-struct Account: Identifiable {
-    let service: String
-    var id: String { service }
+struct Account {
     var plan = ""
     var org: String?
     var usage: Usage?
+    var updated: Date?
     var error: String?
+    var limitedUntil: Date?
     var todayWeekly: Double?
     var breakdown = Breakdown()
 }
 
 @MainActor
 final class Model: ObservableObject {
-    @Published var accounts: [Account] = []
-    @Published var error: String?
-    @Published var updated: Date?
+    @Published var account = Account()
     private let transcripts = Transcripts()
-    private var orgs: [String: String] = [:]   // access token -> organization uuid
+    // Keyed by access token, so a token that Claude Code renewed gets a call at once.
+    private var blocked: [String: Date] = [:]  // token -> end of its HTTP 429 wait
+    private var dead: Set<String> = []         // tokens that got HTTP 401; they never become valid again
     // Plain @Published (not @State): the Command Line Tools SDK ships without the SwiftUI macro plugin.
     @Published var atLogin = SMAppService.mainApp.status == .enabled {
         didSet { try? atLogin ? SMAppService.mainApp.register() : SMAppService.mainApp.unregister() }
@@ -294,67 +286,60 @@ final class Model: ObservableObject {
         Task {
             while true {
                 await refresh()
-                let resets = accounts.flatMap { a in
-                    [a.usage?.five_hour?.resets_at, a.usage?.seven_day?.resets_at, a.usage?.weekly(model: "Fable")?.resets_at]
-                }
-                try? await Task.sleep(for: .seconds(nextRefresh(resets)))
+                let u = account.usage
+                try? await Task.sleep(for: .seconds(nextRefresh([u?.five_hour?.resets_at, u?.seven_day?.resets_at, u?.weekly(model: "Fable")?.resets_at])))
             }
         }
     }
 
-    // Menu bar shows the default login (~/.claude); the other accounts are in the popup.
     var label: String {
         func pct(_ w: Window?) -> String { w.map { "\(Int($0.utilization.rounded()))%" } ?? "–" }
-        let u = accounts.first?.usage
-        return "✱ \(pct(u?.five_hour)) · W \(pct(u?.seven_day))"
+        return "✱ \(pct(account.usage?.five_hour)) · W \(pct(account.usage?.seven_day))"
     }
 
     func refresh() async {
-        let services = credentialServices()
-        error = services.isEmpty ? "No Claude Code login found" : nil
-        var out: [Account] = []
-        for s in services { out.append(await load(s)) }
-        accounts = dedupe(out)
-        if out.contains(where: { $0.error == nil }) { updated = Date() }
+        let org = loggedInOrg()
+        // Keep the last numbers on screen when this refresh fails, but not after a /login to another account.
+        var a = account.org == org ? account : Account()
+        a.org = org; a.error = nil; a.limitedUntil = nil
+        await fetchUsage(&a)
+        // Same 7-day window as the weekly limit. Runs off the main thread: transcripts can be hundreds of MB.
+        let start = (parseDate(a.usage?.seven_day?.resets_at) ?? Date()).addingTimeInterval(-7 * 86400)
+        let t = transcripts
+        let cal = a.usage?.scopedShare()
+        a.breakdown = await Task.detached { t.breakdown(since: start, org: org, calibrate: cal) }.value
+        account = a
     }
 
-    private func load(_ service: String) async -> Account {
-        // Start from the last good data, so a failed refresh keeps the old numbers on screen.
-        var a = accounts.first { $0.service == service } ?? Account(service: service)
-        a.error = nil
-        var org: String?
+    private func fetchUsage(_ a: inout Account) async {
+        let creds: Creds
+        do { creds = try readCredentials() } catch { a.error = "\(error)"; return }
+        a.plan = creds.subscriptionType?.capitalized ?? ""
+        // Never send a token that is known to be bad: the server answers repeated bad calls with HTTP 429.
+        if creds.expired || dead.contains(creds.accessToken) { a.error = loginExpired(creds); return }
+        if let until = blocked[creds.accessToken], until > Date() { a.limitedUntil = until; return }
         do {
-            let creds = try readCredentials(service: service)
-            a.plan = creds.subscriptionType?.capitalized ?? ""
             let usage: Usage = try await api("usage", token: creds.accessToken)
-            a.usage = usage
+            a.usage = usage; a.updated = Date()
             if let w = usage.seven_day?.utilization {
-                // Saved in UserDefaults so an app restart doesn't reset today's count. The default login
-                // keeps the old keys "day"/"base"; others add their Keychain suffix.
-                let k = String(service.dropFirst(baseService.count))
+                // Saved in UserDefaults so an app restart doesn't reset today's count. One pair of keys per
+                // account, so a /login switch does not mix two accounts' numbers.
+                let k = a.org.map { "." + $0 } ?? ""
                 let d = UserDefaults.standard
                 let today = Calendar.current.startOfDay(for: Date()).timeIntervalSince1970
                 let base = todayBase(current: w, savedDay: d.double(forKey: "day" + k), savedBase: d.double(forKey: "base" + k), today: today)
                 d.set(today, forKey: "day" + k); d.set(base, forKey: "base" + k)
                 a.todayWeekly = w - base
             }
-            // The organization tells this account's transcripts apart from the other account's. Asked once per token.
-            if orgs[creds.accessToken] == nil, let p: Profile = try? await api("profile", token: creds.accessToken) {
-                orgs[creds.accessToken] = p.organization.uuid
-            }
-            org = orgs[creds.accessToken]
-            a.org = org
+        } catch let e as RateLimited {
+            blocked[creds.accessToken] = e.until
+            a.limitedUntil = e.until
+        } catch is Unauthorized {
+            dead.insert(creds.accessToken)
+            a.error = loginExpired(creds)
         } catch {
             a.error = "\(error)"
         }
-        // Same 7-day window as the weekly limit. Runs off the main thread: transcripts can be hundreds of MB.
-        if let org {
-            let start = (parseDate(a.usage?.seven_day?.resets_at) ?? Date()).addingTimeInterval(-7 * 86400)
-            let t = transcripts
-            let cal = a.usage?.scopedShare()
-            a.breakdown = await Task.detached { t.breakdown(since: start, org: org, calibrate: cal) }.value
-        }
-        return a
     }
 }
 
@@ -410,7 +395,12 @@ struct AccountView: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
             Text(a.plan.isEmpty ? "Claude" : "Claude · \(a.plan)").font(.headline)
-            if let e = a.error { Text(e).font(.caption).foregroundStyle(.red) }
+            if let until = a.limitedUntil {
+                // HTTP 429: the numbers below are the last ones that loaded.
+                let t = { (d: Date) in d.formatted(date: .omitted, time: .shortened) }
+                Text("Rate limited, retry at \(t(until))" + (a.updated.map { " · data from \(t($0))" } ?? ""))
+                    .font(.caption).foregroundStyle(.orange)
+            } else if let e = a.error { Text(e).font(.caption).foregroundStyle(.red) }
             Row(title: "5-hour session", w: a.usage?.five_hour)
             Row(title: "Weekly", w: a.usage?.seven_day, extra: a.todayWeekly.map { "Today +\(Int($0.rounded()))%" })
             if let f = a.usage?.weekly(model: "Fable") { Row(title: "Weekly · Fable", w: f) }
@@ -430,17 +420,10 @@ struct Panel: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
-            if let e = m.error { Text(e).font(.caption).foregroundStyle(.red) }
-            // One column per account, side by side, so two accounts don't make the popup taller than the screen.
-            HStack(alignment: .top, spacing: 14) {
-                ForEach(m.accounts) { a in
-                    if a.id != m.accounts.first?.id { Divider() }
-                    AccountView(a: a)
-                }
-            }
+            AccountView(a: m.account)
             Divider()
             HStack {
-                Text(m.updated.map { "Updated " + $0.formatted(date: .omitted, time: .shortened) } ?? "Loading…")
+                Text(m.account.updated.map { "Updated " + $0.formatted(date: .omitted, time: .shortened) } ?? "Loading…")
                     .font(.caption).foregroundStyle(.secondary)
                 Button { Task { await m.refresh() } } label: { Image(systemName: "arrow.clockwise") }
                     .buttonStyle(.borderless)
@@ -451,8 +434,6 @@ struct Panel: View {
             }
         }
         .padding(14)
-        // Ideal size, not a minimum: with a flexible width the menu bar window stays at its smallest
-        // width and clips the account columns.
         .fixedSize()
     }
 }
